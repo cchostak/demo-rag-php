@@ -1,329 +1,50 @@
 <?php
 require 'vendor/autoload.php';
 
+// Phase 1 split: load config and OpenAI helper
+require_once __DIR__ . '/src/config.php';
+require_once __DIR__ . '/src/openai.php';
+require_once __DIR__ . '/src/utils.php';
+require_once __DIR__ . '/src/schema.php';
+require_once __DIR__ . '/src/db_write.php';
+require_once __DIR__ . '/src/bootstrap.php';
+
+// Load configuration from src/config.php (splitting index.php)
+require_once __DIR__ . '/src/config.php';
+
 // Simple, production-leaning NL → DB assistant with:
 // - Single textbox for read/write
 // - Dynamic schema RAG over whitelisted tables
 // - Strict write controls (insert/update only by default) with confirmation
 // - Parameterized statements for safety
 
-// -------------------------
-// Configuration
-// -------------------------
-$openaiApiKey = getenv('OPENAI_API_KEY') ?: '';
-$dbHost = getenv('DB_HOST') ?: 'mysql';
-$dbName = getenv('DB_DATABASE') ?: 'sales_db';
-$dbUser = getenv('DB_USERNAME') ?: 'root';
-$dbPass = getenv('DB_PASSWORD') ?: 'example';
-$openaiModel = getenv('OPENAI_MODEL') ?: 'gpt-4o-mini';
-// Logging and rate limiting config
-$logFile = getenv('LOG_FILE') ?: __DIR__ . '/storage/app.log';
-$rateLimitWindowSec = (int)(getenv('RATE_LIMIT_WINDOW_SEC') !== false ? getenv('RATE_LIMIT_WINDOW_SEC') : 60);
-$rateLimitMaxRequests = (int)(getenv('RATE_LIMIT_MAX_REQUESTS') !== false ? getenv('RATE_LIMIT_MAX_REQUESTS') : 20);
-// Pagination
-$defaultPageSize = (int)(getenv('PAGE_SIZE') !== false ? getenv('PAGE_SIZE') : 50);
+// Configuration moved to src/config.php
 
-// Whitelist tables and write permissions (adjust as needed)
-// Default allowlist (can be overridden via EXPOSED_TABLES_JSON)
-$exposedTables = [
-    'sales' => [
-        'read' => true,
-        'write' => [
-            'insert' => ['item_name','quantity','sold_at'],
-            'update' => ['quantity','sold_at'],
-            'delete' => false,
-        ]
-    ],
-    'products' => [
-        'read' => true,
-        'write' => [
-            'insert' => ['name','sku','price','description','category','stock'],
-            'update' => ['price','description','category','stock','name','sku'],
-            'delete' => false,
-        ]
-    ]
-];
+// Bootstrap moved to src/bootstrap.php
 
-// Env-driven overrides
-$maxRows = (int)(getenv('MAX_ROWS') !== false ? getenv('MAX_ROWS') : 100); // default limit for reads
-$requireWriteConfirmation = (function(){
-    $v = getenv('REQUIRE_WRITE_CONFIRMATION');
-    if ($v === false || $v === '') return true; // default on
-    $v = strtolower((string)$v);
-    return !in_array($v, ['0','false','no','off'], true);
-})();
+// ensureProductsTable moved to src/schema.php
 
-// Optional JSON config for allowlist
-$exposedJson = getenv('EXPOSED_TABLES_JSON');
-if (!empty($exposedJson)) {
-    try {
-        $cfg = json_decode($exposedJson, true, 512, JSON_THROW_ON_ERROR);
-        if (is_array($cfg) && $cfg) {
-            $exposedTables = $cfg;
-        }
-    } catch (Throwable $e) {
-        // ignore invalid JSON; keep defaults
-    }
-}
+// askOpenAI moved to src/openai.php
 
-// -------------------------
-// Bootstrap
-// -------------------------
-session_start();
-if (!isset($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
+// ensureDir/log_event moved to src/utils.php
 
-$dsn = sprintf('mysql:host=%s;dbname=%s;charset=utf8mb4', $dbHost, $dbName);
-$pdo = new PDO($dsn, $dbUser, $dbPass, [
-    PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-]);
+// rate_limit_or_die moved to src/utils.php
 
-// Optional: ensure products table exists to smooth local dx when volume was created before seeding
-function ensureProductsTable(PDO $pdo): void {
-    $sql = "CREATE TABLE IF NOT EXISTS products (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        sku VARCHAR(100) NOT NULL UNIQUE,
-        price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
-        description TEXT NULL,
-        category VARCHAR(100) NOT NULL DEFAULT 'general',
-        stock INT NOT NULL DEFAULT 0,
-        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
-    try { $pdo->exec($sql); } catch (Throwable $e) { /* ignore */ }
-}
+// require_csrf_or_die moved to src/utils.php
 
-function askOpenAI(array $messages, string $model) {
-    global $openaiApiKey;
-    if (empty($openaiApiKey)) {
-        throw new Exception('OPENAI_API_KEY is not set');
-    }
-    $client = \OpenAI::client($openaiApiKey);
-    $response = $client->chat()->create([
-        'model' => $model,
-        'messages' => $messages
-    ]);
-    return $response->choices[0]->message->content;
-}
+// loadSchema moved to src/schema.php
 
-function ensureDir(string $path): void {
-    $dir = dirname($path);
-    if (!is_dir($dir)) @mkdir($dir, 0777, true);
-}
+// tableCoverage moved to src/schema.php
 
-function log_event(string $type, array $context = []): void {
-    global $logFile;
-    try {
-        ensureDir($logFile);
-        $entry = [
-            'ts' => gmdate('c'),
-            'type' => $type,
-            'ip' => $_SERVER['REMOTE_ADDR'] ?? null,
-            'ua' => substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 200),
-            'ctx' => $context,
-        ];
-        $line = json_encode($entry) . PHP_EOL;
-        file_put_contents($logFile, $line, FILE_APPEND | LOCK_EX);
-    } catch (Throwable $e) {
-        // ignore logging failures
-    }
-}
+// extractJsonPayload moved to src/utils.php
 
-function rate_limit_or_die(): void {
-    global $rateLimitWindowSec, $rateLimitMaxRequests;
-    if ($rateLimitMaxRequests <= 0) return; // disabled
-    $ip = preg_replace('/[^0-9a-fA-F:\.]/', '', $_SERVER['REMOTE_ADDR'] ?? 'unknown');
-    $file = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'rag_rate_' . md5($ip) . '.json';
-    $now = time();
-    $data = [];
-    $fp = @fopen($file, 'c+');
-    if ($fp) {
-        if (@flock($fp, LOCK_EX)) {
-            $raw = stream_get_contents($fp);
-            $data = json_decode($raw ?: '[]', true) ?: [];
-            $data = array_values(array_filter($data, function($t) use ($now, $rateLimitWindowSec){ return is_int($t) && $t > $now - $rateLimitWindowSec; }));
-            if (count($data) >= $rateLimitMaxRequests) {
-                @flock($fp, LOCK_UN);
-                @fclose($fp);
-                http_response_code(429);
-                echo '<!doctype html><meta charset="utf-8"><title>Rate limit</title><p style="font-family:system-ui,Arial">Too many requests. Please wait a moment and try again.</p>';
-                log_event('rate_limited', ['ip'=>$ip,'count'=>count($data),'window_sec'=>$rateLimitWindowSec]);
-                exit;
-            }
-            $data[] = $now;
-            ftruncate($fp, 0);
-            rewind($fp);
-            fwrite($fp, json_encode($data));
-            fflush($fp);
-            @flock($fp, LOCK_UN);
-            @fclose($fp);
-        } else {
-            @fclose($fp);
-        }
-    }
-}
+// guardSelect moved to src/db_write.php
 
-function require_csrf_or_die(): void {
-    $token = $_POST['csrf_token'] ?? '';
-    $valid = isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], (string)$token);
-    if (!$valid) {
-        http_response_code(400);
-        echo '<!doctype html><meta charset="utf-8"><title>Bad Request</title><p style="font-family:system-ui,Arial">Invalid or missing CSRF token.</p>';
-        exit;
-    }
-}
+// validateWrite moved to src/db_write.php
 
-function loadSchema(PDO $pdo, string $dbName, array $tables): array {
-    if (!$tables) return ['schema'=>[], 'text'=>''];
-    $inPlaceholders = implode(',', array_fill(0, count($tables), '?'));
-    $stmt = $pdo->prepare(
-        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA
-         FROM INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME IN ($inPlaceholders)
-         ORDER BY TABLE_NAME, ORDINAL_POSITION"
-    );
-    $params = array_merge([$dbName], array_keys($tables));
-    $stmt->execute($params);
-    $rows = $stmt->fetchAll();
+// execInsert moved to src/db_write.php
 
-    $schema = [];
-    foreach ($rows as $r) {
-        $t = $r['TABLE_NAME'];
-        if (!isset($schema[$t])) $schema[$t] = ['columns' => []];
-        $schema[$t]['columns'][] = [
-            'name' => $r['COLUMN_NAME'],
-            'type' => $r['DATA_TYPE'],
-            'nullable' => $r['IS_NULLABLE'] === 'YES',
-            'default' => $r['COLUMN_DEFAULT'],
-            'key' => $r['COLUMN_KEY'],
-            'extra' => $r['EXTRA'],
-        ];
-    }
-
-    $textParts = [];
-    foreach ($schema as $table => $info) {
-        $colStrs = array_map(function($c) {
-            $bits = [$c['name'] . ' ' . $c['type']];
-            $bits[] = $c['nullable'] ? 'NULL' : 'NOT NULL';
-            if (!is_null($c['default'])) $bits[] = 'DEFAULT ' . $c['default'];
-            if ($c['key'] === 'PRI') $bits[] = 'PRIMARY KEY';
-            if ($c['key'] === 'UNI') $bits[] = 'UNIQUE';
-            if (!empty($c['extra'])) $bits[] = $c['extra'];
-            return implode(' ', $bits);
-        }, $info['columns']);
-        $textParts[] = sprintf("Table '%s' columns:\n- %s", $table, implode("\n- ", $colStrs));
-    }
-
-    return [
-        'schema' => $schema,
-        'text' => implode("\n\n", $textParts)
-    ];
-}
-
-function tableCoverage(PDO $pdo, string $table, string $dateCol): ?array {
-    try {
-        $t = str_replace('`','``',$table);
-        $c = str_replace('`','``',$dateCol);
-        $sql = "SELECT MIN(`$c`) AS min_date, MAX(`$c`) AS max_date FROM `$t`";
-        $row = $pdo->query($sql)->fetch();
-        if (!$row || (!$row['min_date'] && !$row['max_date'])) return null;
-        return ['min' => $row['min_date'], 'max' => $row['max_date']];
-    } catch (Throwable $e) {
-        return null;
-    }
-}
-
-function extractJsonPayload(string $text): ?array {
-    $raw = trim($text);
-    if (preg_match('/```json\s*(\{[\s\S]*?\})\s*```/i', $raw, $m)) {
-        $raw = $m[1];
-    } elseif (preg_match('/```\s*(\{[\s\S]*?\})\s*```/i', $raw, $m)) {
-        $raw = $m[1];
-    } elseif (preg_match('/\{[\s\S]*\}/', $raw, $m)) {
-        $raw = $m[0];
-    }
-    $data = json_decode($raw ?? '', true);
-    return is_array($data) ? $data : null;
-}
-
-function guardSelect(string $sql, int $maxRows): string {
-    if (!preg_match('/^\s*SELECT\b/i', $sql)) {
-        throw new Exception('Only SELECT allowed for read operations');
-    }
-    if (preg_match('/;\s*\S/', $sql)) {
-        throw new Exception('Multiple statements not allowed');
-    }
-    if (!preg_match('/\bLIMIT\s+\d+/i', $sql)) {
-        $sql .= ' LIMIT ' . (int)$maxRows;
-    }
-    return $sql;
-}
-
-function validateWrite(array $op, array $exposedTables, array $schema): array {
-    // op: { type: insert|update, table: string, values|set: {col=>val}, where_equals?: {col=>val} }
-    if (empty($op['type']) || empty($op['table'])) throw new Exception('Invalid operation payload');
-    $type = strtolower((string)$op['type']);
-    $table = (string)$op['table'];
-    if (!isset($exposedTables[$table])) throw new Exception('Table not allowed: ' . htmlspecialchars($table));
-    $rules = $exposedTables[$table]['write'] ?? [];
-    if (!in_array($type, ['insert','update'], true)) throw new Exception('Write type not permitted');
-
-    if ($type === 'insert') {
-        $allowed = $rules['insert'] ?? [];
-        $values = $op['values'] ?? [];
-        if (!is_array($values) || !$values) throw new Exception('Insert values missing');
-        foreach ($values as $col => $_) {
-            if (!in_array($col, $allowed, true)) throw new Exception('Column not allowed for insert: ' . $col);
-        }
-        return ['type'=>'insert','table'=>$table,'values'=>$values];
-    }
-
-    if ($type === 'update') {
-        $allowed = $rules['update'] ?? [];
-        $set = $op['set'] ?? [];
-        $where = $op['where_equals'] ?? [];
-        if (!is_array($set) || !$set) throw new Exception('Update set missing');
-        foreach ($set as $col => $_) {
-            if (!in_array($col, $allowed, true)) throw new Exception('Column not allowed for update: ' . $col);
-        }
-        if (!is_array($where) || !$where) throw new Exception('Update must include where_equals');
-        return ['type'=>'update','table'=>$table,'set'=>$set,'where_equals'=>$where];
-    }
-
-    throw new Exception('Unsupported write');
-}
-
-function execInsert(PDO $pdo, string $table, array $values): array {
-    $cols = array_keys($values);
-    $placeholders = implode(',', array_fill(0, count($cols), '?'));
-    $colList = implode('`, `', array_map(fn($c) => str_replace('`','``',$c), $cols));
-    $sql = "INSERT INTO `" . str_replace('`','``',$table) . "` (`$colList`) VALUES ($placeholders)";
-    $stmt = $pdo->prepare($sql);
-    $stmt->execute(array_values($values));
-    $id = $pdo->lastInsertId();
-    try {
-        $sel = $pdo->prepare("SELECT * FROM `" . str_replace('`','``',$table) . "` WHERE id = ?");
-        $sel->execute([$id]);
-        $row = $sel->fetch();
-        return ['inserted_id'=>$id,'row'=>$row];
-    } catch (Throwable $e) {
-        return ['inserted_id'=>$id];
-    }
-}
-
-function execUpdate(PDO $pdo, string $table, array $set, array $whereEq): array {
-    $setCols = array_keys($set);
-    $whereCols = array_keys($whereEq);
-    $setExpr = implode(', ', array_map(fn($c) => '`' . str_replace('`','``',$c) . '` = ?', $setCols));
-    $whereExpr = implode(' AND ', array_map(fn($c) => '`' . str_replace('`','``',$c) . '` = ?', $whereCols));
-    $sql = "UPDATE `" . str_replace('`','``',$table) . "` SET $setExpr WHERE $whereExpr";
-    $stmt = $pdo->prepare($sql);
-    $params = array_merge(array_values($set), array_values($whereEq));
-    $stmt->execute($params);
-    return ['affected_rows'=>$stmt->rowCount()];
-}
+// execUpdate moved to src/db_write.php
 
 // -------------------------
 // Build schema context
