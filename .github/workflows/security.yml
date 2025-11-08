@@ -38,7 +38,7 @@ jobs:
         run: composer audit --no-interaction || true
 
   trivy-repo:
-    name: Trivy (repo: vuln/secret/config/license)
+    name: "Trivy (repo: vuln/secret/config/license)"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -115,4 +115,3 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
-
